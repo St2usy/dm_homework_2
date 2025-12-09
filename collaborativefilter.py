@@ -29,46 +29,47 @@ class CFDataset(Dataset):
 # 2. Matrix Factorization 모델 정의
 # ==========================================
 class MatrixFactorization(nn.Module):
-    def __init__(self, num_users, num_items, embedding_dim=32):
+    def __init__(self, num_users, num_items, embedding_dim=32, use_bias=False):
         super(MatrixFactorization, self).__init__()
+        self.use_bias = use_bias # 바이어스 사용 여부 플래그
         
-        # 1. Embeddings (Latent Factors)
-        # 사용자와 아이템을 embedding_dim 차원의 벡터로 표현
+        # 1. Embeddings (User & Item Vector) - 이건 무조건 필요
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.item_embedding = nn.Embedding(num_items, embedding_dim)
         
-        # 2. Bias Terms (편향)
-        # 유저별 점수 주는 성향(후함/짬), 아이템별 평균 인기
-        self.user_bias = nn.Embedding(num_users, 1)
-        self.item_bias = nn.Embedding(num_items, 1)
-        self.global_bias = nn.Parameter(torch.zeros(1)) # 전체 평균 점수
+        # 2. Bias Terms (옵션에 따라 생성)
+        if self.use_bias:
+            self.user_bias = nn.Embedding(num_users, 1)
+            self.item_bias = nn.Embedding(num_items, 1)
+            self.global_bias = nn.Parameter(torch.zeros(1))
 
-        # 3. Initialization (중요: 학습 안정성)
         self._init_weights()
 
     def _init_weights(self):
-        # 임베딩은 작은 랜덤값으로, 바이어스는 0으로 초기화
         nn.init.normal_(self.user_embedding.weight, std=0.01)
         nn.init.normal_(self.item_embedding.weight, std=0.01)
-        self.user_bias.weight.data.fill_(0.0)
-        self.item_bias.weight.data.fill_(0.0)
+        
+        if self.use_bias:
+            self.user_bias.weight.data.fill_(0.0)
+            self.item_bias.weight.data.fill_(0.0)
 
     def forward(self, user, item):
         # (Batch, Dim)
         u_emb = self.user_embedding(user)
         i_emb = self.item_embedding(item)
         
-        # Dot Product: 유저와 아이템 벡터의 유사도 계산
-        # (Batch, Dim) * (Batch, Dim) -> sum -> (Batch,)
+        # Dot Product (순수 상호작용)
         interaction = (u_emb * i_emb).sum(dim=1)
         
-        # Biases
-        u_b = self.user_bias(user).squeeze()
-        i_b = self.item_bias(item).squeeze()
-        
-        # Prediction formula: Global Bias + User Bias + Item Bias + Interaction
-        prediction = self.global_bias + u_b + i_b + interaction
-        return prediction
+        # Global Effect가 없을 때 (Bias 제거)
+        if not self.use_bias:
+            return interaction
+            
+        # Global Effect가 있을 때 (기존 방식)
+        else:
+            u_b = self.user_bias(user).squeeze()
+            i_b = self.item_bias(item).squeeze()
+            return self.global_bias + u_b + i_b + interaction
 
 # ==========================================
 # 3. 데이터 처리 클래스
@@ -111,11 +112,12 @@ def main():
     parser.add_argument('--test', type=str, required=True)
     
     # 튜닝 가능한 파라미터
-    parser.add_argument('--emb_dim', type=int, default=50) # 보통 20~100 사이
-    parser.add_argument('--lr', type=float, default=0.005)
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--emb_dim', type=int, default=80) # 보통 20~100 사이
+    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--epochs', type=int, default=15)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--no_bias', action='store_true', help='Use this flag to disable bias terms')
     
     args = parser.parse_args()
 
@@ -124,6 +126,8 @@ def main():
     np.random.seed(args.seed)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {DEVICE}")
+
+    print(f"Settings: Emb={args.emb_dim}, LR={args.lr}, Batch={args.batch_size}, Global_effact={not args.no_bias}")
 
     # 1. 데이터 로드
     df_train_full = pd.read_csv(args.train)
@@ -149,11 +153,14 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
+    use_bias_flag = not args.no_bias
+    
     # 4. 모델 초기화
     model = MatrixFactorization(
         num_users=processor.num_users, 
         num_items=processor.num_items, 
-        embedding_dim=args.emb_dim
+        embedding_dim=args.emb_dim,
+        use_bias=use_bias_flag
     ).to(DEVICE)
     
     criterion = nn.MSELoss()

@@ -130,7 +130,7 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden layer dimension')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
-    parser.add_argument('--batch_size', type=int, default=512, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
