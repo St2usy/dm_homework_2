@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ==========================================
 # 1. Dataset (ID + Content 모두 포함)
@@ -165,17 +166,19 @@ def main():
     parser.add_argument('--test', type=str, required=True)
     
     # 파라미터 튜닝 영역
-    parser.add_argument('--emb_dim', type=int, default=32) 
+    parser.add_argument('--emb_dim', type=int, default=64) 
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=20) # Epoch 수 증가 추천
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=20) 
     
     args = parser.parse_args()
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hybrid Recommender on {DEVICE}")
+
+    print(f"Settings: Emb={args.emb_dim}, Hidden={args.hidden_dim}, LR={args.lr}, Drop={args.dropout}, Batch={args.batch_size}")
 
     # 1. Data Load
     df_train_full = pd.read_csv(args.train)
@@ -209,7 +212,8 @@ def main():
     ).to(DEVICE)
     
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
     # 3. Training
     best_loss = float('inf')
@@ -237,11 +241,15 @@ def main():
                 
         avg_train = train_loss / len(train_loader)
         avg_val = val_loss / len(val_loader)
+
+        scheduler.step(avg_val)
+
         print(f"Epoch {epoch+1} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
         
         if avg_val < best_loss:
             best_loss = avg_val
-
+    
+    print(f"Best Validation Loss: {best_loss:.4f}")
     # 4. Prediction
     model.eval()
     preds = []
@@ -265,7 +273,7 @@ def main():
     else:
         submission = pd.DataFrame({'userId': df_test['userId'], 'movieId': df_test['movieId'], 'rating': preds})
         
-    submission.to_csv('submission.csv', index=False)
+    submission.to_csv('submission3.csv', index=False)
     print("Hybrid Submission Saved!")
 
 if __name__ == "__main__":
