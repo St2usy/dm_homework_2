@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split # 데이터 분할용
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ==========================================
 # 1. 데이터셋 정의 (Dataset)
@@ -44,6 +45,7 @@ class ContentRecommender(nn.Module):
         
         self.fc_layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),  # 학습 안정화
             nn.ReLU(),
             nn.Dropout(dropout), # Dropout 파라미터 적용
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -79,23 +81,28 @@ class DataProcessor:
         self.year_max = 1
         
     def fit(self, df_train, df_test):
+        # UID Mappings
         all_users = pd.concat([df_train['userId'], df_test['userId']]).unique()
         self.user_to_idx = {uid: i for i, uid in enumerate(all_users)}
         
+        # Genre Mapping
         all_genres = set()
         for genres_str in pd.concat([df_train['genres'], df_test['genres']]):
             if pd.isna(genres_str): continue
             all_genres.update(str(genres_str).split('|'))
-        
         for i, genre in enumerate(sorted(all_genres), start=1):
             self.genre_to_idx[genre] = i
-            
+        
+        # Year Statistics
         all_years = pd.concat([df_train['year'], df_test['year']]).values
         self.year_min = all_years.min()
         self.year_max = all_years.max()
         
     def transform(self, df):
+        # ID
         user_ids = df['userId'].map(lambda x: self.user_to_idx.get(x, 0)).values
+
+        # Genres
         genre_lists = []
         for genres_str in df['genres']:
             indices = []
@@ -104,12 +111,16 @@ class DataProcessor:
                     if g in self.genre_to_idx:
                         indices.append(self.genre_to_idx[g])
             genre_lists.append(indices)
+
+        # Year
         years = df['year'].values.astype(float)
         if self.year_max > self.year_min:
             years = (years - self.year_min) / (self.year_max - self.year_min)
         else:
             years = np.zeros_like(years)
+
         ratings = df['rating'].values if 'rating' in df.columns else None
+
         return user_ids, genre_lists, years, ratings
     
     @property
@@ -126,12 +137,13 @@ def main():
     parser.add_argument('--test', type=str, required=True)
     
     # 튜닝할 파라미터들을 인자로 받도록 설정
-    parser.add_argument('--emb_dim', type=int, default=16, help='Embedding dimension')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden layer dimension')
+    parser.add_argument('--emb_dim', type=int, default=64, help='Embedding dimension')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden layer dimension')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--dropout', type=float, default=0.4, help='Dropout rate')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
     parser.add_argument('--batch_size', type=int, default=512, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=30, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=15, help='Number of epochs')
+    parser.add_argument('--weight_decay', type=float, default=1e-4) # 규제 필수
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     args = parser.parse_args()
@@ -175,10 +187,12 @@ def main():
     ).to(DEVICE)
     
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
     # 3. 학습 및 검증
     best_val_loss = float('inf')
+    best_epoch = 0
     
     for epoch in range(args.epochs):
         # Train
@@ -186,6 +200,7 @@ def main():
         train_loss = 0
         for u, g, y, r in train_loader:
             u, g, y, r = u.to(DEVICE), g.to(DEVICE), y.to(DEVICE), r.to(DEVICE)
+
             optimizer.zero_grad()
             preds = model(u, g, y)
             loss = criterion(preds, r)
@@ -205,43 +220,79 @@ def main():
         
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
-        
-        # Validation Loss가 가장 낮을 때의 성능 기록
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1:02d} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | LR: {current_lr}")
+
+        scheduler.step(avg_val_loss)
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            # 여기서 모델 저장 가능 (torch.save)
+            best_epoch = epoch + 1
         
-        print(f"Epoch {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+    print(f"Best Validation Loss: {best_val_loss:.4f} at Epoch {best_epoch}")
 
-    print(f"Best Validation Loss: {best_val_loss:.4f}")
-
-    # 4. 전체 데이터로 재학습 (Optional)
-    # 실험이 끝나고 최종 제출용을 만들 때는 Validation 없이 전체 데이터로 학습하는 것이 좋음
-    # 여기서는 생략하고 바로 Test 예측 진행
+    print(f"\n>>> Phase 2: Re-training on FULL Dataset for {best_epoch} epochs...")
+    
+    # 1. 전체 데이터로 데이터셋/로더 다시 생성
+    full_train_data = processor.transform(df_train_full)
+    full_train_dataset = ContentBasedDataset(*full_train_data)
+    full_train_loader = DataLoader(full_train_dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # 2. 모델 및 옵티마이저 초기화 (완전히 새롭게 시작)
+    final_model = ContentRecommender(
+        num_users=processor.num_users,
+        num_genres=processor.num_genres,
+        embedding_dim=args.emb_dim,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout
+    ).to(DEVICE)
+    
+    final_optimizer = optim.Adam(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Full Train에서는 Validation이 없으므로 Scheduler는 보통 끄거나 동일하게 적용. 여기선 단순화를 위해 끔.
+    
+    # 3. Best Epoch만큼 재학습
+    for epoch in range(best_epoch):
+        final_model.train()
+        total_loss = 0
+        for u, g, y, r in full_train_loader:
+            u, g, y, r = u.to(DEVICE), g.to(DEVICE), y.to(DEVICE), r.to(DEVICE)            
+            final_optimizer.zero_grad()
+            pred = final_model(u, g, y)
+            loss = criterion(pred, r)
+            loss.backward()
+            final_optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(full_train_loader)
+        print(f"Full Train Epoch {epoch+1}/{best_epoch} | Loss: {avg_loss:.4f}")
+    
 
     # 5. Test 예측 및 저장
-    model.eval()
-    predictions = []
+    final_model.eval()
+    preds = []
+
+    min_rating = df_train_full['rating'].min()
+    max_rating = df_train_full['rating'].max()
+
     with torch.no_grad():
         for u, g, y in test_loader:
             u, g, y = u.to(DEVICE), g.to(DEVICE), y.to(DEVICE)
-            preds = model(u, g, y)
-            predictions.extend(preds.cpu().numpy())
+            pred = final_model(u, g, y)
+            preds.extend(pred.cpu().numpy())
             
     # 후처리 (정수 변환)
-    min_rating = df_train_full['rating'].min()
-    max_rating = df_train_full['rating'].max()
-    predictions = np.clip(predictions, min_rating, max_rating)
-    predictions = np.round(predictions*2)/2
+    preds = np.array(preds)
+    preds = np.clip(preds, min_rating, max_rating)
+    preds = np.round(preds * 2) / 2
     
-    # 저장
     if 'rId' in df_test.columns:
-        sub = pd.DataFrame({'rId': df_test['rId'], 'rating': predictions})
+        sub = pd.DataFrame({'rId': df_test['rId'], 'rating': preds})
     else:
-        sub = pd.DataFrame({'userId': df_test['userId'], 'movieId': df_test['movieId'], 'rating': predictions})
+        sub = pd.DataFrame({'userId': df_test['userId'], 'movieId': df_test['movieId'], 'rating': preds})
         
     sub.to_csv('submission2.csv', index=False)
-    print("submission.csv saved.")
+    print("Content Based saved.")
 
 if __name__ == "__main__":
     main()

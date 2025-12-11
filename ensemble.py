@@ -8,23 +8,23 @@ def main():
     
     # 1. 입력 파일 경로 설정 (기본값 설정)
     parser.add_argument('--deepfm', type=str, default='submission4.csv', help='Path to DeepFM submission csv')
-    parser.add_argument('--cb', type=str, default='submission2.csv', help='Path to CB submission csv')
     parser.add_argument('--hy', type=str, default='submission3.csv', help='Path to HY submission csv')
+    parser.add_argument('--cb', type=str, default='submission2.csv', help='Path to CB submission csv')
     parser.add_argument('--output', type=str, default='submission.csv', help='Output filename')
     
     # 2. 가중치 설정 (합이 1.0이 되도록 설정하는 것을 권장)
     # 성능이 좋은 모델에 더 높은 가중치를 줍니다. (예: DeepFM > Hybrid > CF)
-    parser.add_argument('--w1', type=float, default=0.5, help='Weight for DeepFM')
-    parser.add_argument('--w2', type=float, default=0.2, help='Weight for CB')
-    parser.add_argument('--w3', type=float, default=0.3, help='Weight for HY')
+    parser.add_argument('--w1', type=float, default=0.6, help='Weight for DeepFM')
+    parser.add_argument('--w2', type=float, default=0.3, help='Weight for HY')
+    parser.add_argument('--w3', type=float, default=0.1, help='Weight for CB')
     
     args = parser.parse_args()
 
     print("="*50)
     print(f"Ensembling 3 Models...")
     print(f"1. DeepFM ({args.w1}): {args.deepfm}")
-    print(f"2. CB ({args.w2}): {args.cb}")
-    print(f"3. HY     ({args.w3}): {args.hy}")
+    print(f"2. HY ({args.w2}): {args.hy}")
+    print(f"3. CB     ({args.w3}): {args.cb}")
     print("="*50)
 
     # 파일 존재 여부 확인
@@ -34,8 +34,8 @@ def main():
 
     # 3. 데이터 로드
     df1 = pd.read_csv(args.deepfm)
-    df2 = pd.read_csv(args.cb)
-    df3 = pd.read_csv(args.hy)
+    df2 = pd.read_csv(args.hy)
+    df3 = pd.read_csv(args.cb)
 
     # 4. 데이터 정합성 체크 (매우 중요)
     # 모든 파일의 행 개수가 같아야 하고, ID 순서가 동일해야 엉뚱한 점수를 섞지 않음

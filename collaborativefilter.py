@@ -112,11 +112,11 @@ def main():
     parser.add_argument('--test', type=str, required=True)
     
     # 튜닝 가능한 파라미터
-    parser.add_argument('--emb_dim', type=int, default=20) # 보통 20~100 사이
+    parser.add_argument('--emb_dim', type=int, default=50) # 보통 20~100 사이
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--seed', type=int, default=43)
+    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no_bias', action='store_true', help='Use this flag to disable bias terms')
     
     args = parser.parse_args()

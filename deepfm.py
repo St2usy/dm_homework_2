@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+import copy
 
 # ==========================================
 # 1. Dataset (Field-aware 구조로 변경)
@@ -21,9 +22,9 @@ class DeepFMDataset(Dataset):
         # DeepFM은 입력 필드 개수가 고정되는 것이 유리하므로, 주요 장르 1~3개만 피처로 사용
         self.genre_indices = np.zeros((len(user_ids), max_genres), dtype=int)
         for i, genres in enumerate(genre_lists):
-            l = min(len(genres), max_genres)
-            if l > 0:
-                self.genre_indices[i, :l] = genres[:l]
+            length = min(len(genres), max_genres)
+            if length > 0:
+                self.genre_indices[i, :length] = genres[:length]
         self.genre_indices = torch.LongTensor(self.genre_indices)
 
     def __len__(self):
@@ -213,19 +214,28 @@ def main():
     parser.add_argument('--emb_dim', type=int, default=16) # DeepFM은 임베딩이 너무 크면 FM 파트에서 노이즈가 심해짐
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--batch_size', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=15)
     parser.add_argument('--weight_decay', type=float, default=1e-4) # 규제 필수
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+
     
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"DeepFM on {DEVICE}")
+
+    print(f"Settings: Emb={args.emb_dim}, Hidden={args.hidden_dim}, LR={args.lr}, Drop={args.dropout}, Batch={args.batch_size}")
+   
 
     # Load Data
     df_train_full = pd.read_csv(args.train)
     df_test = pd.read_csv(args.test)
-    df_train, df_val = train_test_split(df_train_full, test_size=0.1, random_state=42)
+    df_train, df_val = train_test_split(df_train_full, test_size=0.1, random_state=args.seed)
     
     processor = DataProcessor()
     processor.fit(df_train_full, df_test)
@@ -262,7 +272,8 @@ def main():
 
     # Training Loop
     best_loss = float('inf')
-    best_model_state = None
+    best_epoch = 0
+    # best_model_state = None
     
     for epoch in range(args.epochs):
         model.train()
@@ -295,21 +306,59 @@ def main():
         # Save Best Model
         if avg_val < best_loss:
             best_loss = avg_val
-            best_model_state = model.state_dict()
+            # best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
 
     # Prediction using Best Model
-    print(f"Best Val Loss: {best_loss:.4f}. Generating Submission...")
-    model.load_state_dict(best_model_state)
-    model.eval()
+    print(f"Best Val Loss: {best_loss:.4f} at Epoch {best_epoch}")
     
+    print(f"\n>>> Phase 2: Re-training on FULL Dataset for {best_epoch} epochs...")
+    
+    # 1. 전체 데이터로 데이터셋/로더 다시 생성
+    full_train_data = processor.transform(df_train_full)
+    full_train_dataset = DeepFMDataset(*full_train_data, max_genres=3)
+    full_train_loader = DataLoader(full_train_dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # 2. 모델 및 옵티마이저 초기화 (완전히 새롭게 시작)
+    final_model = DeepFM(
+        num_users=processor.num_users,
+        num_items=processor.num_items,
+        num_genres=processor.num_genres,
+        emb_dim=args.emb_dim,
+        hidden_dims=[args.hidden_dim, args.hidden_dim//2],
+        dropout=args.dropout
+    ).to(DEVICE)
+    
+    final_optimizer = optim.Adam(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Full Train에서는 Validation이 없으므로 Scheduler는 보통 끄거나 동일하게 적용. 여기선 단순화를 위해 끔.
+    
+    # 3. Best Epoch만큼 재학습
+    for epoch in range(best_epoch):
+        final_model.train()
+        total_loss = 0
+        for u, i, g, y, r in full_train_loader:
+            u, i, g, y, r = u.to(DEVICE), i.to(DEVICE), g.to(DEVICE), y.to(DEVICE), r.to(DEVICE)
+            final_optimizer.zero_grad()
+            pred = final_model(u, i, g, y)
+            loss = criterion(pred, r)
+            loss.backward()
+            final_optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(full_train_loader)
+        print(f"Full Train Epoch {epoch+1}/{best_epoch} | Loss: {avg_loss:.4f}")
+
+
+    final_model.eval()
     preds = []
+    
     min_rating = df_train_full['rating'].min()
     max_rating = df_train_full['rating'].max()
     
     with torch.no_grad():
         for u, i, g, y in test_loader:
             u, i, g, y = u.to(DEVICE), i.to(DEVICE), g.to(DEVICE), y.to(DEVICE)
-            pred = model(u, i, g, y)
+            pred = final_model(u, i, g, y)
             preds.extend(pred.cpu().numpy())
             
     preds = np.array(preds)
@@ -322,7 +371,7 @@ def main():
         sub = pd.DataFrame({'userId': df_test['userId'], 'movieId': df_test['movieId'], 'rating': preds})
     
     sub.to_csv('submission4.csv', index=False)
-    print("Done.")
+    print("DeepFm Submission Saved!.")
 
 if __name__ == "__main__":
     main()

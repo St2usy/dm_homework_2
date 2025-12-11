@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import copy
 
 # ==========================================
 # 1. Dataset (ID + Content 모두 포함)
@@ -72,6 +73,7 @@ class HybridRecommender(nn.Module):
         for layer in self.fc_layers:
             if isinstance(layer, nn.Linear):
                 nn.init.kaiming_uniform_(layer.weight)
+                layer.bias.data.fill_(0.0)
 
     def forward(self, user_idx, item_idx, genre_indices, year):
         # 1. ID Embedding (CF signal)
@@ -104,10 +106,10 @@ class DataProcessor:
         self.year_max = 1
         
     def fit(self, df_train, df_test):
-        # ID Mappings
+        # UID Mappings
         all_users = pd.concat([df_train['userId'], df_test['userId']]).unique()
         self.user_to_idx = {uid: i for i, uid in enumerate(all_users)}
-        
+        # IID Mappings
         all_items = pd.concat([df_train['movieId'], df_test['movieId']]).unique()
         self.item_to_idx = {iid: i for i, iid in enumerate(all_items)}
         
@@ -170,10 +172,16 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=20) 
+    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--epochs', type=int, default=15) 
+    parser.add_argument('--weight_decay', type=float, default=1e-4) # 규제 필수
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     args = parser.parse_args()
+
+    # 랜덤 시드 고정 (재현성을 위해 필수)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Hybrid Recommender on {DEVICE}")
@@ -184,7 +192,8 @@ def main():
     df_train_full = pd.read_csv(args.train)
     df_test = pd.read_csv(args.test)
     
-    df_train, df_val = train_test_split(df_train_full, test_size=0.1, random_state=42)
+    # Train 데이터 내에서 검증셋 분리 (8:2)
+    df_train, df_val = train_test_split(df_train_full, test_size=0.1, random_state=args.seed)
     
     processor = DataProcessor()
     processor.fit(df_train_full, df_test)
@@ -212,11 +221,14 @@ def main():
     ).to(DEVICE)
     
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
 
     # 3. Training
     best_loss = float('inf')
+    best_epoch = 0
+    # best_model_state = None
+
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
@@ -236,22 +248,63 @@ def main():
         with torch.no_grad():
             for u, i, g, y, r in val_loader:
                 u, i, g, y, r = u.to(DEVICE), i.to(DEVICE), g.to(DEVICE), y.to(DEVICE), r.to(DEVICE)
-                pred = model(u, i, g, y)
-                val_loss += criterion(pred, r).item()
+                preds = model(u, i, g, y)
+                loss = criterion(preds, r)
+                val_loss += loss.item()
                 
         avg_train = train_loss / len(train_loader)
         avg_val = val_loss / len(val_loader)
 
         scheduler.step(avg_val)
 
-        print(f"Epoch {epoch+1} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1:02d} | Train: {avg_train:.4f} | Val: {avg_val:.4f} | LR: {current_lr}")
         
         if avg_val < best_loss:
             best_loss = avg_val
+            # best_model_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
     
-    print(f"Best Validation Loss: {best_loss:.4f}")
+    print(f"Best Validation Loss: {best_loss:.4f} at Epoch {best_epoch}")
+    
+    print(f"\n>>> Phase 2: Re-training on FULL Dataset for {best_epoch} epochs...")
+    
+    # 1. 전체 데이터로 데이터셋/로더 다시 생성
+    full_train_data = processor.transform(df_train_full)
+    full_train_dataset = HybridDataset(*full_train_data)
+    full_train_loader = DataLoader(full_train_dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # 2. 모델 및 옵티마이저 초기화 (완전히 새롭게 시작)
+    final_model = HybridRecommender(
+        num_users=processor.num_users,
+        num_items=processor.num_items,
+        num_genres=processor.num_genres,
+        emb_dim=args.emb_dim,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout
+    ).to(DEVICE)
+    
+    final_optimizer = optim.Adam(final_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Full Train에서는 Validation이 없으므로 Scheduler는 보통 끄거나 동일하게 적용. 여기선 단순화를 위해 끔.
+    
+    # 3. Best Epoch만큼 재학습
+    for epoch in range(best_epoch):
+        final_model.train()
+        total_loss = 0
+        for u, i, g, y, r in full_train_loader:
+            u, i, g, y, r = u.to(DEVICE), i.to(DEVICE), g.to(DEVICE), y.to(DEVICE), r.to(DEVICE)
+            final_optimizer.zero_grad()
+            pred = final_model(u, i, g, y)
+            loss = criterion(pred, r)
+            loss.backward()
+            final_optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(full_train_loader)
+        print(f"Full Train Epoch {epoch+1}/{best_epoch} | Loss: {avg_loss:.4f}")
+
     # 4. Prediction
-    model.eval()
+    final_model.eval()
     preds = []
     
     min_rating = df_train_full['rating'].min()
@@ -260,7 +313,7 @@ def main():
     with torch.no_grad():
         for u, i, g, y in test_loader:
             u, i, g, y = u.to(DEVICE), i.to(DEVICE), g.to(DEVICE), y.to(DEVICE)
-            pred = model(u, i, g, y)
+            pred = final_model(u, i, g, y)
             preds.extend(pred.cpu().numpy())
             
     # Post-processing
